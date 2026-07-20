@@ -17,8 +17,17 @@ from rembg import remove, new_session
 
 
 class BackgroundRemover():
-    def __init__(self):
-        self.session = new_session()
+    # isnet-general-use, not rembg's own default (u2net): validated across 6
+    # objects (agentic system/images/large scale test/) after u2net was found
+    # to drop entire thin/bright foreground regions outright (e.g. a jewelry
+    # holder's metal tree, alpha=0 -- not a soft/partial edge, real content
+    # loss) and to fuse a hallucinated base plane onto at least one other
+    # object (game controller holder) tightly enough that per-component
+    # debris checks didn't catch it. isnet-general-use fixed both failure
+    # modes with no regressions on the 4 already-clean control cases tested
+    # alongside them, at no measurable runtime cost.
+    def __init__(self, model_name: str = "isnet-general-use"):
+        self.session = new_session(model_name)
 
     def __call__(self, image: Image.Image):
         output = remove(image, session=self.session, bgcolor=[255, 255, 255, 0])
