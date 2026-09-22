@@ -26,9 +26,29 @@ class BackgroundRemover():
     # debris checks didn't catch it. isnet-general-use fixed both failure
     # modes with no regressions on the 4 already-clean control cases tested
     # alongside them, at no measurable runtime cost.
-    def __init__(self, model_name: str = "isnet-general-use"):
+    #
+    # alpha_matting=True is a second, separate fix on top of that: found on
+    # 3 of the Gemini-holders batch's own images (tablet/laptop/umbrella
+    # holders -- all light-gray/silver/white objects with large flat
+    # low-saturation surfaces) where isnet-general-use's raw alpha output
+    # itself was near-zero across whole interior regions, not just soft at
+    # the edges -- e.g. the entire tablet backplate came back alpha=~0,
+    # confirmed by inspecting the raw pre-threshold alpha channel directly.
+    # rembg's alpha_matting refinement (a trimap + closed-form matting
+    # solve on top of the same base network output) recovered all 3 cleanly
+    # with no thresholds changed downstream. Re-checked against the 7
+    # already-clean holders in that same batch (opaque-pixel-count delta
+    # under 2% in every case, confirmed visually on two) -- no regression
+    # found, so this is the new default rather than a per-object override.
+    def __init__(self, model_name: str = "isnet-general-use", alpha_matting: bool = True):
         self.session = new_session(model_name)
+        self.alpha_matting = alpha_matting
 
     def __call__(self, image: Image.Image):
-        output = remove(image, session=self.session, bgcolor=[255, 255, 255, 0])
+        if self.alpha_matting:
+            output = remove(image, session=self.session, bgcolor=[255, 255, 255, 0],
+                             alpha_matting=True, alpha_matting_foreground_threshold=240,
+                             alpha_matting_background_threshold=10)
+        else:
+            output = remove(image, session=self.session, bgcolor=[255, 255, 255, 0])
         return output

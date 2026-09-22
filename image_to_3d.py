@@ -3,6 +3,7 @@
 
 import argparse
 import gc
+import json
 import os
 import sys
 
@@ -25,6 +26,11 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=1234, help="Shape generation RNG seed")
     parser.add_argument("--octree-resolution", type=int, default=384, help="Marching-cubes octree resolution for shape extraction (higher preserves thin struts better)")
     parser.add_argument("--num-inference-steps", type=int, default=50, help="Diffusion steps for shape generation")
+    parser.add_argument(
+        "--save-generation-latents", action="store_true",
+        help="Persist the sampled diffusion latent and the scaled ShapeVAE input beside the mesh. "
+             "This is opt-in because the tensors are generation provenance, not required for normal runs.",
+    )
     parser.add_argument("--no-plane-fix", action="store_true",
                          help="Skip the hard-alpha-threshold + tight-recrop preprocessing (default: on). "
                               "That preprocessing fixed 13/13 hallucinated-background-plane cases in the "
@@ -39,7 +45,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def harden_alpha_and_recrop(image, threshold: int = 250, margin_frac: float = 0.08):
+def harden_alpha_and_recrop(image, threshold: int = 128, margin_frac: float = 0.08):
     """Snap alpha to fully opaque/transparent, then crop tight to the opaque
     bounding box with a small margin. Removes feathered-edge gradients and
     surrounding negative-space canvas -- empirically, this is what stopped
@@ -47,6 +53,19 @@ def harden_alpha_and_recrop(image, threshold: int = 250, margin_frac: float = 0.
     the object (see images/large scale test/ consistency run: 13/13 fixed).
     Mirrors preprocess_hardalpha.py at the project root, duplicated here
     (rather than imported) so generation has no cross-directory dependency.
+
+    threshold lowered from the original 250 to 128 after BackgroundRemover
+    started using alpha_matting (see hy3dshape/rembg.py): matting's output
+    is a real coverage fraction, not a near-binary classifier confidence
+    like raw isnet-general-use, so a handful of real objects with a soft
+    photographic gradient (a brushed-metal laptop tray's diagonal reflection
+    highlight, confirmed on 04_laptop_holder in the Gemini-holders batch)
+    only recover to ~150-230 alpha even once correctly identified as
+    foreground -- threshold=250 was silently re-punching the same hole
+    alpha_matting had just recovered. Re-checked at 128 against 3
+    already-clean cases (01/06/09) with no halo/edge regression (opaque
+    pixel count grew <2% in each, all in thin edge-antialiasing, not new
+    background inclusion).
     """
     import numpy as np
     from PIL import Image
@@ -118,12 +137,69 @@ def main():
     print(f"Generating mesh from image (seed={args.seed}, octree_resolution={args.octree_resolution}, "
           f"num_inference_steps={args.num_inference_steps})...")
     generator = torch.Generator().manual_seed(args.seed)
-    mesh = shape_pipeline(
-        image=image,
-        generator=generator,
-        octree_resolution=args.octree_resolution,
-        num_inference_steps=args.num_inference_steps,
-    )[0]
+    save_generation_latents = args.save_generation_latents or os.environ.get(
+        "HUNYUAN_SAVE_GENERATION_LATENTS", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    generation_latent_path = os.path.join(run_dir, f"{run_name}_generation_latents.pt")
+    shape_vae_z_path = os.path.join(run_dir, f"{run_name}_shape_vae_z.pt")
+    latent_manifest_path = os.path.join(run_dir, f"{run_name}_generation_latents.json")
+
+    if save_generation_latents:
+        # Request the final diffusion sample before _export transforms it. Decode that same
+        # tensor explicitly, so latent capture cannot change the geometry or consume a second
+        # random sample. shape_vae_z is the coordinate consumed by ShapeVAE.decode and is the
+        # useful starting point for differentiable latent-space optimization.
+        diffusion_latent = shape_pipeline(
+            image=image,
+            generator=generator,
+            octree_resolution=args.octree_resolution,
+            num_inference_steps=args.num_inference_steps,
+            box_v=1.01,
+            mc_level=-1 / 512,
+            num_chunks=8000,
+            mc_algo=None,
+            enable_pbar=True,
+            output_type="latent",
+        )
+        shape_vae_z = diffusion_latent / shape_pipeline.vae.scale_factor
+        mesh = shape_pipeline._export(
+            diffusion_latent,
+            output_type="trimesh",
+            octree_resolution=args.octree_resolution,
+            box_v=1.01,
+            mc_level=-1 / 512,
+            num_chunks=8000,
+            mc_algo=None,
+            enable_pbar=True,
+        )[0]
+        torch.save(diffusion_latent.detach().cpu(), generation_latent_path)
+        torch.save(shape_vae_z.detach().cpu(), shape_vae_z_path)
+        latent_manifest = {
+            "schema_version": 1,
+            "run_name": run_name,
+            "source_image": os.path.abspath(args.image),
+            "preprocessed_image": os.path.abspath(image_path_for_paint),
+            "model": "tencent/Hunyuan3D-2.1",
+            "seed": args.seed,
+            "num_inference_steps": args.num_inference_steps,
+            "octree_resolution": args.octree_resolution,
+            "vae_scale_factor": float(shape_pipeline.vae.scale_factor),
+            "diffusion_latent_shape": list(diffusion_latent.shape),
+            "diffusion_latent_dtype": str(diffusion_latent.dtype),
+            "diffusion_latent_path": os.path.abspath(generation_latent_path),
+            "shape_vae_z_path": os.path.abspath(shape_vae_z_path),
+            "mesh_decode": "pipeline._export(diffusion_latent, output_type='trimesh')",
+        }
+        with open(latent_manifest_path, "w") as stream:
+            json.dump(latent_manifest, stream, indent=2)
+        print(f"Generation latents saved to {generation_latent_path} and {shape_vae_z_path}")
+    else:
+        mesh = shape_pipeline(
+            image=image,
+            generator=generator,
+            octree_resolution=args.octree_resolution,
+            num_inference_steps=args.num_inference_steps,
+        )[0]
     mesh.export(shape_glb_path)
     print(f"Untextured shape saved to {shape_glb_path}")
 
